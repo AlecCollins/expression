@@ -387,4 +387,28 @@ private class StringFunctionsTest {
     private static void likeFunction_singleCharacterWildcard_doesNotMatch() {
         Assert.areEqual(false, Evaluator.run('LIKE("Hello World", "H_llo")'));
     }
+    
+    @IsTest
+    private static void evalFunctionEvaluatesSimpleExpression() {
+        // Test basic arithmetic
+        Assert.areEqual(3, Evaluator.run('EVAL("1 + 2")'));
+    }
+    
+    @IsTest
+    private static void evalFunctionEvaluatesStringExpression() {
+        // Test string concatenation with proper escaping
+        Assert.areEqual('Hello World', Evaluator.run('EVAL("\'Hello\' + \' World\'")'));
+    }
+    
+    @IsTest
+    private static void evalFunctionEvaluatesNestedFunctions() {
+        // Test nested functions
+        Assert.areEqual('HELLO', Evaluator.run('EVAL("UPPER(\'hello\')")'));
+    }
+    
+    @IsTest
+    private static void evalFunctionThrowsRuntimeExceptionWhenArgumentIsNotString() {
+        String formula = 'EVAL(123)';
+        runExpectingRuntimeException(formula);
+    }
 }

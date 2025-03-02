@@ -5,6 +5,12 @@
  * @display-icon utility:text
  */
 public with sharing class StringFunctions {
+    // Cache maps used across all EVAL function instances 
+    private static Map<Id, SObject> CACHED_RECORDS = new Map<Id, SObject>();
+    private static Map<Id, Long> LAST_QUERY_TIME_BY_RECORD_ID = new Map<Id, Long>();
+    private static Map<String, Set<String>> EXPRESSION_FIELD_CACHE = new Map<String, Set<String>>();
+    private static Set<String> COMPLETED_QUERIES = new Set<String>();
+    
     private static final Map<String, StandardFunction> FUNCTIONS = new Map<String, StandardFunction>{
         'BEGINS' => new StringFunctions.Begins(),
         'CONTAINS' => new StringFunctions.Contains(),
@@ -28,7 +34,8 @@ public with sharing class StringFunctions {
         'SPLIT' => new SplitFn(),
         'INITCAP' => new InitCapFn(),
         'URLENCODE' => new UrlEncodeFn(),
-        'LIKE' => new LikeFn()
+        'LIKE' => new LikeFn(),
+        'EVAL' => new EvalFn()
     };
 
     public class StringFunctionsProvider implements FunctionProvider {
@@ -859,6 +866,495 @@ public with sharing class StringFunctions {
             // Test the text against the pattern
             Matcher matcher = regex.matcher(text);
             return matcher.matches();
+        }
+    }
+
+    /**
+     * @description Evaluates a string expression dynamically and returns the result.
+     *
+     * Accepts 1 or 2 arguments:
+     * 1. The string expression to evaluate
+     * 2. (Optional) The context object to use for evaluation. Can be an SObject, a record ID, or a variable reference
+     *
+     * The function can access the current context for fields and add them to the context if they don't exist.
+     * @function EVAL
+     * @example
+     * EVAL("1 + 2") // 3
+     * EVAL("'Hello ' + 'World'") // "Hello World"
+     * EVAL("@Context.FirstName + ' ' + @Context.LastName") // Concatenates two context fields
+     * EVAL("Description") // Evaluates Description field in current context (e.g., current quote line item)
+     * EVAL("Number", @Context.Quote) // Evaluates Number field in parent Quote context
+     * 
+     * When used with MAP, each item becomes the context:
+     * MAP(QuoteLineItems, EVAL("Description")) // Description from each line item
+     * MAP(QuoteLineItems, EVAL("@Context.Quote.Name")) // Parent quote name for each line item
+     */
+    private class EvalFn extends StandardFunction {
+        // Counter to track cache hits
+        private Integer cacheHits = 0;
+        
+        public override Object call(List<Expr> arguments) {
+            // Check that the first argument is a string
+            Object expressionArg = evaluate(arguments.get(0));
+            if (!(expressionArg instanceof String)) {
+                throw new FunctionExecutionException(
+                    'Error executing "EVAL" function: the first argument must evaluate to a string value.'
+                );
+            }
+
+            String expressionString = (String) expressionArg;
+            
+            // Check for optional second argument - the context
+            SObject contextSObject = null;
+            Id contextRecordId = null;
+            Object customContextObj = null;
+            
+            if (arguments.size() > 1) {
+                Object contextArg = evaluate(arguments.get(1));
+                System.debug(LoggingLevel.INFO, 'EVAL function - Context argument provided: ' + 
+                           (contextArg != null ? contextArg.toString() : 'null'));
+                
+                // Determine type of context
+                if (contextArg instanceof SObject) {
+                    contextSObject = (SObject)contextArg;
+                    if (contextSObject.Id != null) {
+                        contextRecordId = contextSObject.Id;
+                    }
+                    System.debug(LoggingLevel.INFO, 'EVAL function - Using explicit SObject context: ' + 
+                               contextSObject.getSObjectType() + (contextRecordId != null ? ' ID: ' + contextRecordId : ''));
+                } else if (contextArg instanceof Id) {
+                    contextRecordId = (Id)contextArg;
+                    System.debug(LoggingLevel.INFO, 'EVAL function - Using explicit ID context: ' + contextRecordId);
+                } else {
+                    // Store as custom context
+                    customContextObj = contextArg;
+                    System.debug(LoggingLevel.INFO, 'EVAL function - Using explicit custom context: ' + 
+                               (customContextObj != null ? customContextObj.toString() : 'null'));
+                }
+            }
+            
+            System.debug(LoggingLevel.INFO, 'EVAL function - Expression to evaluate: ' + expressionString);
+            
+            try {
+                // Check if we have an interpreter (which should have been set by FunctionCaller)
+                if (interpreter == null) {
+                    System.debug(LoggingLevel.ERROR, 'EVAL function - No interpreter available');
+                    throw new FunctionExecutionException('Error executing "EVAL" function: No interpreter available');
+                }
+                System.debug(LoggingLevel.INFO, 'EVAL function - Got interpreter');
+                
+                // Get the current environment which contains the context
+                Environment currentEnv = interpreter.getEnvironment();
+                if (currentEnv == null) {
+                    System.debug(LoggingLevel.ERROR, 'EVAL function - Current environment is null');
+                    throw new FunctionExecutionException('Error executing "EVAL" function: No environment available');
+                }
+                
+                System.debug(LoggingLevel.INFO, 'EVAL function - Got current environment');
+                
+                // Get contextual data from environment if not already provided by second argument
+                if (contextSObject == null && contextRecordId == null && customContextObj == null) {
+                    try {
+                        if (currentEnv.contains('@context')) {
+                            Object contextObj = currentEnv.get('@context');
+                            System.debug(LoggingLevel.INFO, 'EVAL function - Found @context: ' + 
+                                       (contextObj != null ? contextObj.toString() : 'null'));
+                            
+                            if (contextObj instanceof SObject) {
+                                contextSObject = (SObject)contextObj;
+                                if (contextSObject.Id != null) {
+                                    contextRecordId = contextSObject.Id;
+                                }
+                                System.debug(LoggingLevel.INFO, 'EVAL function - Context is SObject: ' + 
+                                           contextSObject.getSObjectType());
+                            } else if (contextObj instanceof Id) {
+                                contextRecordId = (Id)contextObj;
+                                System.debug(LoggingLevel.INFO, 'EVAL function - Context is ID: ' + contextRecordId);
+                            } else {
+                                customContextObj = contextObj;
+                                System.debug(LoggingLevel.INFO, 'EVAL function - Context is custom: ' + 
+                                           (customContextObj != null ? customContextObj.toString() : 'null'));
+                            }
+                        } else {
+                            System.debug(LoggingLevel.INFO, 'EVAL function - No @context found in environment');
+                        }
+                    } catch (Exception e) {
+                        System.debug(LoggingLevel.ERROR, 'EVAL function - Error accessing @context: ' + e.getMessage());
+                    }
+                }
+                
+                // Create a configuration with diagnostics enabled
+                Configuration config = new Configuration();
+                config.withDiagnostics(); // Enable diagnostics for debugging
+                
+                // Get context variables from the environment
+                Map<String, Object> contextMap = new Map<String, Object>();
+                
+                // If there's an explicitly provided custom context, prioritize it
+                if (customContextObj != null) {
+                    // Add the object itself as "context"
+                    contextMap.put('context', customContextObj);
+                    
+                    // If it's a map, also add its entries
+                    if (customContextObj instanceof Map<String, Object>) {
+                        Map<String, Object> contextAsMap = (Map<String, Object>)customContextObj;
+                        contextMap.putAll(contextAsMap);
+                        System.debug(LoggingLevel.INFO, 'EVAL function - Added ' + contextAsMap.size() + 
+                                   ' keys from explicit context map');
+                    }
+                } 
+                // Otherwise collect context from the environment
+                else if (currentEnv != null) {
+                    // Look for context variables in the environment
+                    for (String varName : getEnvironmentVariables(currentEnv)) {
+                        if (varName.startsWith('@')) {
+                            try {
+                                if (currentEnv.contains(varName)) {
+                                    Object value = currentEnv.get(varName);
+                                    String contextKey = varName.substring(1); // Remove @ prefix
+                                    contextMap.put(contextKey, value); 
+                                    String valueStr = value != null ? String.valueOf(value) : 'null';
+                                    if (valueStr.length() > 100) {
+                                        valueStr = valueStr.substring(0, 97) + '...';
+                                    }
+                                    System.debug(LoggingLevel.INFO, 'EVAL function - Adding context variable: ' + 
+                                               varName + ' = ' + valueStr);
+                                }
+                            } catch (Exception e) {
+                                System.debug(LoggingLevel.ERROR, 'EVAL function - Error accessing variable ' + 
+                                           varName + ': ' + e.getMessage());
+                            }
+                        }
+                    }
+                }
+                
+                // If we have an explicit context SObject, make sure it's included
+                if (contextSObject != null) {
+                    contextMap.put('context', contextSObject);
+                    if (contextRecordId != null) {
+                        contextMap.put('id', contextRecordId);
+                    }
+                }
+                
+                // Add the context map to the configuration
+                if (!contextMap.isEmpty()) {
+                    config.withCustomContext(contextMap);
+                    System.debug(LoggingLevel.INFO, 'EVAL function - Added ' + contextMap.size() + 
+                               ' context variables to the evaluation');
+                }
+                
+                // Pre-analyze the expression to retrieve all fields we're going to need
+                try {
+                    // Determine which ID to use for record lookup and caching
+                    Id recordId = null;
+                    
+                    // First priority: explicit ID passed as context
+                    if (contextRecordId != null) {
+                        recordId = contextRecordId;
+                        System.debug(LoggingLevel.INFO, 'EVAL function - Using explicit context ID: ' + recordId);
+                    }
+                    // Second priority: ID from explicit SObject
+                    else if (contextSObject != null && contextSObject.Id != null) {
+                        recordId = contextSObject.Id;
+                        System.debug(LoggingLevel.INFO, 'EVAL function - Using ID from explicit context record: ' + recordId);
+                    }
+                    // Third priority: ID from environment
+                    else if (currentEnv != null && currentEnv.contains('@id') && currentEnv.get('@id') instanceof Id) {
+                        recordId = (Id)currentEnv.get('@id');
+                        System.debug(LoggingLevel.INFO, 'EVAL function - Using ID from environment: ' + recordId);
+                    }
+                    
+                    // If we have a record ID, check if we already have an enriched version in cache
+                    if (recordId != null) {
+                        // Create a unique key for this expression + record combination
+                        String normalizedExpression = expressionString.trim().toLowerCase();
+                        String cacheKey = recordId + ':' + normalizedExpression;
+                        
+                        System.debug(LoggingLevel.INFO, 'EVAL function - Cache key: ' + cacheKey);
+                        System.debug(LoggingLevel.INFO, 'EVAL function - Completed queries: ' + COMPLETED_QUERIES.size());
+                        
+                        // If we've already successfully handled this exact expression for this record, skip querying
+                        if (COMPLETED_QUERIES.contains(cacheKey)) {
+                            cacheHits++;
+                            System.debug(LoggingLevel.INFO, 'EVAL function - *** CACHE HIT! *** Already completed this exact query: ' + cacheKey);
+                            
+                            // Simply use the cached record for evaluation
+                            SObject cachedRecord = CACHED_RECORDS.get(recordId);
+                            if (cachedRecord != null) {
+                                System.debug(LoggingLevel.INFO, 'EVAL function - Using cached record with fields: ' + 
+                                           cachedRecord.getPopulatedFieldsAsMap().keySet());
+                                EvaluatorResolver evaluator = EvaluatorResolver.forRecord(cachedRecord);
+                                
+                                // Evaluate and return immediately to avoid any redundant processing
+                                EvaluationResult result = evaluator.evaluate(expressionString, config);
+                                System.debug(LoggingLevel.INFO, 'EVAL function - Evaluation result (from cache hit #' + cacheHits + '): ' + result.result);
+                                return result.result;
+                            }
+                        }
+                        
+                        System.debug(LoggingLevel.INFO, 'EVAL function - Working with record ID: ' + recordId);
+                        
+                        // Determine exactly which fields are needed for this expression
+                        Set<String> fieldsNeeded;
+                        if (EXPRESSION_FIELD_CACHE.containsKey(expressionString)) {
+                            fieldsNeeded = EXPRESSION_FIELD_CACHE.get(expressionString);
+                            System.debug(LoggingLevel.INFO, 'EVAL function - Using cached field list for expression: ' + fieldsNeeded);
+                        } else {
+                            fieldsNeeded = getFieldsFromExpression(expressionString);
+                            EXPRESSION_FIELD_CACHE.put(expressionString, fieldsNeeded);
+                            System.debug(LoggingLevel.INFO, 'EVAL function - Fields needed for expression: ' + fieldsNeeded);
+                        }
+                        
+                        // First, try to get the record from our static cache
+                        SObject enrichedRecord = null;
+                        Boolean foundInCache = false;
+                        Boolean needsRefresh = false;
+                        
+                        // Check if the record is in cache and has all needed fields
+                        if (CACHED_RECORDS.containsKey(recordId)) {
+                            enrichedRecord = CACHED_RECORDS.get(recordId);
+                            foundInCache = true;
+                            
+                            if (enrichedRecord != null) {
+                                Set<String> fieldsInRecord = enrichedRecord.getPopulatedFieldsAsMap().keySet();
+                                System.debug(LoggingLevel.INFO, 'EVAL function - Found record in cache with fields: ' + fieldsInRecord);
+                                
+                                // Check if ALL needed fields are already in the cached record
+                                Boolean allFieldsInCache = true;
+                                for (String field : fieldsNeeded) {
+                                    if (!fieldsInRecord.contains(field.toLowerCase())) {
+                                        System.debug(LoggingLevel.INFO, 'EVAL function - Field not in cache: ' + field);
+                                        allFieldsInCache = false;
+                                        break;
+                                    }
+                                }
+                                
+                                // If we have all fields, we're done!
+                                if (allFieldsInCache) {
+                                    System.debug(LoggingLevel.INFO, 'EVAL function - All needed fields found in cache, NO QUERY NEEDED');
+                                    EvaluatorResolver evaluator = EvaluatorResolver.forRecord(enrichedRecord);
+                                    // Mark this query as completed
+                                    COMPLETED_QUERIES.add(cacheKey);
+                                    
+                                    // Evaluate and return immediately
+                                    EvaluationResult result = evaluator.evaluate(expressionString, config);
+                                    System.debug(LoggingLevel.INFO, 'EVAL function - Evaluation result (all fields in cache): ' + result.result);
+                                    return result.result;
+                                } else {
+                                    needsRefresh = true;
+                                }
+                            } else {
+                                needsRefresh = true;
+                            }
+                        } else {
+                            needsRefresh = true;
+                        }
+                        
+                        // Prevent excessive queries by enforcing a time limit between queries for the same record
+                        Long currentTime = System.currentTimeMillis();
+                        if (LAST_QUERY_TIME_BY_RECORD_ID.containsKey(recordId)) {
+                            Long lastQueryTime = LAST_QUERY_TIME_BY_RECORD_ID.get(recordId);
+                            Long timeSinceLastQuery = currentTime - lastQueryTime;
+                            
+                            // If it's been less than 100ms since our last query, use what we have instead of querying again
+                            if (timeSinceLastQuery < 100 && foundInCache) {
+                                System.debug(LoggingLevel.INFO, 'EVAL function - THROTTLING QUERY - Last query was ' + 
+                                           timeSinceLastQuery + 'ms ago, using cached data');
+                                EvaluatorResolver evaluator = EvaluatorResolver.forRecord(enrichedRecord);
+                                
+                                // Evaluate and return immediately
+                                EvaluationResult result = evaluator.evaluate(expressionString, config);
+                                System.debug(LoggingLevel.INFO, 'EVAL function - Evaluation result (throttled): ' + result.result);
+                                return result.result;
+                            }
+                        }
+                        
+                        // If we need to refresh or don't have the record cached
+                        if (needsRefresh) {
+                            System.debug(LoggingLevel.INFO, 'EVAL function - Querying for fields needed by expression');
+                            LAST_QUERY_TIME_BY_RECORD_ID.put(recordId, currentTime);
+                            
+                            SObject freshRecord = EvaluatorResolver.retrieveRecordForFormulas(
+                                recordId, new List<String>{ expressionString }
+                            );
+                            
+                            if (freshRecord != null) {
+                                if (foundInCache && enrichedRecord != null) {
+                                    // Merge the fresh record with the cached one to get all fields
+                                    Map<String, Object> existingFields = enrichedRecord.getPopulatedFieldsAsMap();
+                                    for (String field : freshRecord.getPopulatedFieldsAsMap().keySet()) {
+                                        if (!existingFields.containsKey(field)) {
+                                            enrichedRecord.put(field, freshRecord.get(field));
+                                        }
+                                    }
+                                    System.debug(LoggingLevel.INFO, 'EVAL function - Updated cached record with new fields: ' + 
+                                               freshRecord.getPopulatedFieldsAsMap().keySet());
+                                } else {
+                                    // Use the fresh record directly
+                                    enrichedRecord = freshRecord;
+                                    System.debug(LoggingLevel.INFO, 'EVAL function - Using freshly queried record with fields: ' + 
+                                               enrichedRecord.getPopulatedFieldsAsMap().keySet());
+                                }
+                                
+                                // Update the cache
+                                CACHED_RECORDS.put(recordId, enrichedRecord);
+                                
+                                // Mark this query as completed so we don't repeat it
+                                COMPLETED_QUERIES.add(cacheKey);
+                            }
+                        }
+                        
+                        // Use the enriched record for evaluation if we have one
+                        if (enrichedRecord != null) {
+                            System.debug(LoggingLevel.INFO, 'EVAL function - Using record for evaluation with fields: ' + 
+                                       enrichedRecord.getPopulatedFieldsAsMap().keySet());
+                            EvaluatorResolver evaluator = EvaluatorResolver.forRecord(enrichedRecord);
+                            EvaluationResult result = evaluator.evaluate(expressionString, config);
+                            System.debug(LoggingLevel.INFO, 'EVAL function - Evaluation result: ' + result.result);
+                            return result.result;
+                        }
+                    }
+                    
+                    // Choose the right evaluation approach based on available context
+                    EvaluatorResolver evaluator;
+                    
+                    // Special handling for SObject context for best field resolution
+                    if (contextSObject != null) {
+                        System.debug(LoggingLevel.INFO, 'EVAL function - Using SObject with ID: ' + contextSObject.Id);
+                        
+                        // Try to use forId when possible to allow field querying
+                        if (contextSObject.Id != null) {
+                            // This will allow dynamic field querying when needed
+                            System.debug(LoggingLevel.INFO, 'EVAL function - Using forId evaluator for dynamic field querying');
+                            evaluator = EvaluatorResolver.forId(contextSObject.Id);
+                        } else {
+                            System.debug(LoggingLevel.INFO, 'EVAL function - Using forRecord evaluator (no dynamic field querying)');
+                            evaluator = EvaluatorResolver.forRecord(contextSObject);
+                        }
+                    } else {
+                        // Check if we can still find an ID in the context
+                        Id contextId = null;
+                        try {
+                            if (currentEnv.contains('@id')) {
+                                Object idValue = currentEnv.get('@id');
+                                if (idValue instanceof Id) {
+                                    contextId = (Id)idValue;
+                                    System.debug(LoggingLevel.INFO, 'EVAL function - Found @id: ' + contextId);
+                                }
+                            }
+                        } catch (Exception e) {
+                            System.debug(LoggingLevel.ERROR, 'EVAL function - Error accessing @id: ' + e.getMessage());
+                        }
+                        
+                        if (contextId != null) {
+                            // We have an ID but no record, use forId to allow dynamic field querying
+                            System.debug(LoggingLevel.INFO, 'EVAL function - Using forId evaluator with ID: ' + contextId);
+                            evaluator = EvaluatorResolver.forId(contextId);
+                        } else {
+                            System.debug(LoggingLevel.INFO, 'EVAL function - Using without context evaluation (no dynamic field querying)');
+                            evaluator = EvaluatorResolver.withoutContext();
+                        }
+                    }
+                    
+                    // Evaluate using the chosen approach
+                    EvaluationResult result = evaluator.evaluate(expressionString, config);
+                    System.debug(LoggingLevel.INFO, 'EVAL function - Evaluation result: ' + result.result);
+                    return result.result;
+                    
+                } catch (Exception e) {
+                    System.debug(LoggingLevel.ERROR, 'EVAL function - Error pre-analyzing expression: ' + e.getMessage());
+                    // Fall back to simple evaluation without context
+                    EvaluatorResolver evaluator = EvaluatorResolver.withoutContext();
+                    EvaluationResult result = evaluator.evaluate(expressionString, config);
+                    return result.result;
+                }
+                
+            } catch (Exception e) {
+                System.debug(LoggingLevel.ERROR, 'EVAL function - Error: ' + e.getMessage() + '\n' + e.getStackTraceString());
+                throw new FunctionExecutionException(
+                    'Error executing "EVAL" function: ' + e.getMessage()
+                );
+            }
+        }
+        
+        // Helper method to get environment variables
+        private Set<String> getEnvironmentVariables(Environment env) {
+            Set<String> variables = new Set<String>();
+            
+            // First, check basic context variables we know should be available in most environments
+            variables.add('@context');
+            variables.add('@id');
+            variables.add('@ids');
+            variables.add('@user');
+            variables.add('@record');
+            
+            // Add other common context variables
+            variables.add('@firstname');
+            variables.add('@lastname');
+            variables.add('@name');
+            variables.add('@email');
+            variables.add('@phone');
+            variables.add('@recordtype');
+            variables.add('@owner');
+            variables.add('@createddate');
+            variables.add('@lastmodifieddate');
+            
+            // Log presence of any context variables
+            System.debug(LoggingLevel.INFO, 'EVAL function - Checking for context variables');
+            for (String varName : variables) {
+                try {
+                    if (env.contains(varName)) {
+                        System.debug(LoggingLevel.INFO, 'EVAL function - Found context variable: ' + varName);
+                    }
+                } catch (Exception e) {
+                    // Ignore errors on missing variables
+                    System.debug(LoggingLevel.FINE, 'EVAL function - Error checking variable ' + varName + ': ' + e.getMessage());
+                }
+            }
+            
+            return variables;
+        }
+        
+        // Helper method to extract field names from an expression string
+        private Set<String> getFieldsFromExpression(String expressionString) {
+            Set<String> fields = new Set<String>();
+            
+            try {
+                // Simple pattern-based extraction of potential field references in the form @Context.FieldName
+                Pattern fieldPattern = Pattern.compile('@Context\\.(\\w+)');
+                Matcher fieldMatcher = fieldPattern.matcher(expressionString);
+                
+                while (fieldMatcher.find()) {
+                    String fieldName = fieldMatcher.group(1);
+                    fields.add(fieldName);
+                    System.debug(LoggingLevel.INFO, 'EVAL function - Extracted field from expression: ' + fieldName);
+                }
+                
+                // If it's a simple expression that might just be a field name without @Context.
+                if (expressionString.indexOf('.') == -1 && 
+                    expressionString.indexOf('(') == -1 && 
+                    expressionString.indexOf('+') == -1 &&
+                    expressionString.indexOf('-') == -1 &&
+                    expressionString.indexOf('*') == -1 &&
+                    expressionString.indexOf('/') == -1 &&
+                    expressionString.indexOf('\"') == -1 &&
+                    expressionString.indexOf('\'') == -1) {
+                    // This might be a direct field reference like "Name"
+                    String potentialField = expressionString.trim();
+                    if (!String.isBlank(potentialField)) {
+                        fields.add(potentialField);
+                        System.debug(LoggingLevel.INFO, 'EVAL function - Added potential direct field reference: ' + potentialField);
+                    }
+                }
+            } catch (Exception e) {
+                System.debug(LoggingLevel.ERROR, 'EVAL function - Error extracting fields: ' + e.getMessage());
+            }
+            
+            return fields;
+        }
+
+        public override Arity getArity() {
+            return Arity.between(1, 2); // 1 required argument, 1 optional context argument
         }
     }
 }
